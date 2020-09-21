@@ -1,0 +1,12 @@
+[package]
+name = "scatter"
+version = "0.1.0"
+authors = ["John VanEnk <jvanenk@fastly.com>"]
+edition = "2018"
+
+[dependencies]
+bytes = "0.5.6"
+tokio = { version = "0.2.22", features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "0.2.22", features = ["rt-core", "io-util", "net", "macros" ] }
