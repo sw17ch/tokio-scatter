@@ -1,7 +1,13 @@
 use bytes::BytesMut;
-use std::task::{Context, Poll};
 use std::{collections::HashMap, collections::HashSet, future::Future, pin::Pin};
+use std::{
+    sync::Arc,
+    task::{Context, Poll},
+};
 use tokio::io::AsyncWrite;
+
+mod spinner;
+mod waker;
 
 /// An internal type used to track state on each individual writer.
 struct Writer<W>
@@ -17,8 +23,11 @@ where
     /// writer.
     error: Option<std::io::Error>,
 
+    /// The waker for this specific Writer.
+    waker: Option<std::task::Waker>,
+
     /// The underlying writer into which we send data.
-    w: W,
+    writer: W,
 }
 
 impl<W> Writer<W>
@@ -30,7 +39,8 @@ where
         Self {
             written: 0,
             error: None,
-            w,
+            waker: None,
+            writer: w,
         }
     }
 }
@@ -116,25 +126,32 @@ where
     /// it here rather than in the loop itself so that we can avoid
     /// re-allocating this `Vec` for each `Work` future.
     moved: Vec<u64>,
+
+    /// A list of IDs that have been awoken. This is updated by WakerProxy types
+    /// passed to `Future::poll()` through Context types.
+    awoke: Arc<waker::IdList>,
+
+    /// A vector that is swapped to the `IdList` with `take()`. This allows us
+    // to try and avoid having to resize a vector while holding a spin lock.
+    awoke_ids: Vec<u64>,
 }
 
 impl<W> Scatter<W>
 where
     W: AsyncWrite + Unpin,
 {
-    /// Create a new `Scatter` type. This does no allocation.
+    /// Create a new `Scatter` type.
     pub fn new() -> Self {
         Self {
             next_id: 0,
             buf: Default::default(),
-
             writers: Default::default(),
-
             behind: Default::default(),
             current: Default::default(),
             errors: Default::default(),
-
             moved: Default::default(),
+            awoke: Default::default(),
+            awoke_ids: Default::default(),
         }
     }
 
@@ -153,8 +170,12 @@ where
         let r = self.writers.insert(id, w);
         debug_assert!(r.is_none());
 
+        // New writers start behind.
         let r = self.behind.insert(id);
         debug_assert!(r);
+
+        // New writers also get placed in the `awoke` list immediately.
+        self.awoke.push(id);
     }
 
     /// Return a future that resolves when all clients have been caught up. This
@@ -164,7 +185,14 @@ where
     }
 
     fn move_current_to_behind(&mut self) {
-        for k in self.current.drain() {
+        // Gather all the IDs that are caught up.
+        let current = self.current.drain().collect::<Vec<u64>>();
+
+        // Mark them as awoken.
+        self.awoke.push_slice(&current[..]);
+
+        // Insert all of them into behind.
+        for k in current {
             let r = self.behind.insert(k);
             debug_assert!(r);
         }
@@ -265,7 +293,12 @@ where
             let r = self.scatter.errors.remove(&id);
             debug_assert!(r);
 
-            let Writer { w, written, error } = self
+            let Writer {
+                writer,
+                written,
+                error,
+                ..
+            } = self
                 .scatter
                 .writers
                 .remove(&id)
@@ -273,7 +306,7 @@ where
             let error = error.expect("Writer in error set does not have an error");
 
             return Some(Finished::Err {
-                writer: w,
+                writer,
                 written,
                 error,
             });
@@ -290,14 +323,19 @@ where
             let r = self.scatter.current.remove(&id);
             debug_assert!(r);
 
-            let Writer { w, written, error } = self
+            let Writer {
+                writer,
+                written,
+                error,
+                ..
+            } = self
                 .scatter
                 .writers
                 .remove(&id)
                 .expect("current ID missing from writers");
             debug_assert!(error.is_none());
 
-            return Some(Finished::Ok { writer: w, written });
+            return Some(Finished::Ok { writer, written });
         }
 
         // If there are no currents or errors, we have no more finished writers.
@@ -328,16 +366,25 @@ where
             current,
             errors,
             moved,
+            awoke,
+            awoke_ids,
             ..
         } = &mut *self.scatter;
 
-        for id in behind.iter() {
+        awoke.take(awoke_ids);
+
+        for id in awoke_ids.iter() {
             let writer = writers.get_mut(id).expect("ID not found in writers");
 
             // The written amount should never exceed the buffer length so far.
             debug_assert!(writer.written <= buf.len());
 
-            let r = Pin::new(&mut writer.w).poll_write(cx, &buf[writer.written..]);
+            // Create a proxy waker for this writer. When it wakes, it will add
+            // its ID to the awoke list, and then wake the main task.
+            writer.waker = Some(waker::proxy_waker(*id, awoke, cx));
+            let mut cx = Context::from_waker(writer.waker.as_ref().unwrap());
+
+            let r = Pin::new(&mut writer.writer).poll_write(&mut cx, &buf[writer.written..]);
             match r {
                 Poll::Ready(Ok(len)) => {
                     // Some data was written successfully.
